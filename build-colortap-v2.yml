@@ -1,0 +1,2060 @@
+name: Build ColorTap v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build-colortap-v2.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Принять лицензии Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Создать проект
+        run: |
+          mkdir -p app
+          cat > app/build.gradle <<'FILE_0_END'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.mushka.colortap'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.mushka.colortap"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 2
+                  versionName "2.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.encoding = 'UTF-8'
+          }
+          FILE_0_END
+          cat > build.gradle <<'FILE_1_END'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          FILE_1_END
+          cat > gradle.properties <<'FILE_2_END'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          FILE_2_END
+          cat > settings.gradle <<'FILE_3_END'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ColorTap"
+          include ':app'
+          FILE_3_END
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FILE_4_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Автокликер по цвету"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".RulesActivity"
+                      android:exported="false" />
+
+                  <activity
+                      android:name=".RuleEditActivity"
+                      android:exported="false" />
+
+                  <activity
+                      android:name=".StepEditActivity"
+                      android:exported="false" />
+
+                  <service
+                      android:name=".ColorService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".TapService"
+                      android:exported="true"
+                      android:label="Автокликер по цвету"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/tap_service" />
+                  </service>
+              </application>
+          </manifest>
+          FILE_4_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/ColorService.java <<'FILE_5_END'
+          package com.mushka.colortap;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.graphics.drawable.GradientDrawable;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.util.DisplayMetrics;
+          import android.view.Display;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.nio.ByteBuffer;
+          import java.util.List;
+
+          public class ColorService extends Service {
+              private static final int STEP = 3;
+              private static final int CELL = 48;
+
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private WindowManager wm;
+              private MediaProjection mp;
+              private MediaProjection.Callback mpCallback;
+              private VirtualDisplay vd;
+              private ImageReader reader;
+              private int cw;
+              private int ch;
+              private int dpi;
+              private SharedPreferences prefs;
+              private RuleManager rm;
+
+              private LinearLayout bar;
+              private WindowManager.LayoutParams barLp;
+              private TextView bGo;
+              private TextView bInfo;
+              private View ovl;
+              private PickView pv;
+
+              private boolean running;
+              private boolean executing;
+              private List<Rule> rules;
+              private boolean[] armed;
+              private boolean[] done;
+              private long[] lastFire;
+              private int[][] lastPts;
+              private volatile boolean dirty = true;
+              private int activeRule = -1;
+              private int activeStep = -1;
+              private final SharedPreferences.OnSharedPreferenceChangeListener prefListener =
+                      (sp, key) -> {
+                          if ("rules_v2".equals(key)) dirty = true;
+                      };
+
+              @Override
+              public IBinder onBind(Intent in) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent in, int flags, int startId) {
+                  if (in == null || "STOP".equals(in.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (mp != null) return START_NOT_STICKY;
+                  prefs = getSharedPreferences("c", MODE_PRIVATE);
+                  rm = new RuleManager(this);
+                  prefs.registerOnSharedPreferenceChangeListener(prefListener);
+                  startFg();
+
+                  MediaProjectionManager m =
+                          (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                  mp = m.getMediaProjection(in.getIntExtra("code", 0),
+                          (Intent) in.getParcelableExtra("data"));
+                  if (mp == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  mpCallback = new MediaProjection.Callback() {
+                      @Override
+                      public void onStop() {
+                          stopSelf();
+                      }
+                  };
+                  mp.registerCallback(mpCallback, h);
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  makeDisplay();
+                  showBar();
+                  return START_NOT_STICKY;
+              }
+
+              private void startFg() {
+                  NotificationManager nm =
+                          (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("c", "Автокликер",
+                          NotificationManager.IMPORTANCE_LOW));
+                  Intent stop = new Intent(this, ColorService.class).setAction("STOP");
+                  PendingIntent pi = PendingIntent.getService(this, 1, stop,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification n = new Notification.Builder(this, "c")
+                          .setSmallIcon(android.R.drawable.ic_menu_search)
+                          .setContentTitle("Автокликер работает")
+                          .setContentText("Нажми «Остановить», чтобы выключить")
+                          .addAction(new Notification.Action.Builder(
+                                  android.R.drawable.ic_menu_close_clear_cancel,
+                                  "Остановить", pi).build())
+                          .setOngoing(true)
+                          .build();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n,
+                              ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                  } else {
+                      startForeground(1, n);
+                  }
+              }
+
+              private DisplayMetrics realMetrics() {
+                  DisplayMetrics dm = new DisplayMetrics();
+                  DisplayManager dmg =
+                          (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                  dmg.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm);
+                  return dm;
+              }
+
+              private void makeDisplay() {
+                  DisplayMetrics dm = realMetrics();
+                  cw = dm.widthPixels;
+                  ch = dm.heightPixels;
+                  dpi = dm.densityDpi;
+                  reader = ImageReader.newInstance(cw, ch, PixelFormat.RGBA_8888, 2);
+                  vd = mp.createVirtualDisplay("cap", cw, ch, dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          reader.getSurface(), null, h);
+              }
+
+              private void fitDisplay() {
+                  DisplayMetrics dm = realMetrics();
+                  if (dm.widthPixels == cw && dm.heightPixels == ch) return;
+                  cw = dm.widthPixels;
+                  ch = dm.heightPixels;
+                  ImageReader old = reader;
+                  reader = ImageReader.newInstance(cw, ch, PixelFormat.RGBA_8888, 2);
+                  vd.resize(cw, ch, dpi);
+                  vd.setSurface(reader.getSurface());
+                  old.close();
+                  lastPts = null;
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private void toast(String s) {
+                  Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+              }
+
+              private WindowManager.LayoutParams params(int w, int hh) {
+                  WindowManager.LayoutParams lp = new WindowManager.LayoutParams(w, hh,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      lp.layoutInDisplayCutoutMode =
+                              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+                  } else if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode =
+                              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                  }
+                  return lp;
+              }
+
+              private TextView btn(String text) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextColor(Color.WHITE);
+                  t.setTextSize(14);
+                  t.setPadding(dp(10), dp(8), dp(10), dp(8));
+                  return t;
+              }
+
+              private void showBar() {
+                  bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+                  bar.setPadding(dp(6), dp(4), dp(6), dp(4));
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(0xEE171A2C);
+                  g.setCornerRadius(dp(22));
+                  g.setStroke(dp(1), 0x556C8CFF);
+                  bar.setBackground(g);
+
+                  TextView handle = btn("≡");
+                  bInfo = btn("0/0");
+                  TextView bPick = btn("Пипетка");
+                  TextView bReg = btn("Область");
+                  TextView bRules = btn("Правила");
+                  bGo = btn("Старт");
+                  TextView bX = btn("✕");
+
+                  bar.addView(handle);
+                  bar.addView(bInfo);
+                  bar.addView(bPick);
+                  bar.addView(bReg);
+                  bar.addView(bRules);
+                  bar.addView(bGo);
+                  bar.addView(bX);
+
+                  bPick.setOnClickListener(v -> startPick());
+                  bReg.setOnClickListener(v -> startRegion());
+                  bRules.setOnClickListener(v -> {
+                      Intent i = new Intent(this, RulesActivity.class);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(i);
+                  });
+                  bGo.setOnClickListener(v -> toggle());
+                  bX.setOnClickListener(v -> stopSelf());
+
+                  barLp = params(WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT);
+                  barLp.x = dp(12);
+                  barLp.y = dp(80);
+
+                  handle.setOnTouchListener(new View.OnTouchListener() {
+                      float dx, dy;
+
+                      @Override
+                      public boolean onTouch(View v, MotionEvent e) {
+                          switch (e.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  dx = e.getRawX() - barLp.x;
+                                  dy = e.getRawY() - barLp.y;
+                                  return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  barLp.x = (int) (e.getRawX() - dx);
+                                  barLp.y = (int) (e.getRawY() - dy);
+                                  wm.updateViewLayout(bar, barLp);
+                                  return true;
+                              default:
+                                  return true;
+                          }
+                      }
+                  });
+                  wm.addView(bar, barLp);
+                  updateBar();
+              }
+
+              private void updateBar() {
+                  if (bar == null) return;
+                  bGo.setText(running ? "Стоп" : "Старт");
+                  int en = 0, tot = 0;
+                  List<Rule> rl = rm.load();
+                  for (Rule r : rl) {
+                      tot++;
+                      if (r.enabled && !r.steps.isEmpty()) en++;
+                  }
+                  if (activeRule >= 0 && activeStep >= 0 && activeRule < rl.size()) {
+                      bInfo.setText((activeRule + 1) + ":" + (activeStep + 1));
+                  } else {
+                      bInfo.setText(en + "/" + tot);
+                  }
+              }
+
+              private void reloadRules() {
+                  rules = rm.load();
+                  int n = rules.size();
+                  armed = new boolean[n];
+                  done = new boolean[n];
+                  lastFire = new long[n];
+                  java.util.Arrays.fill(armed, true);
+                  lastPts = null;
+                  dirty = false;
+              }
+
+              private void toggle() {
+                  if (running) {
+                      running = false;
+                      executing = false;
+                      activeRule = -1;
+                      activeStep = -1;
+                  } else {
+                      if (TapService.inst == null) {
+                          toast("Включи службу доступности");
+                          return;
+                      }
+                      reloadRules();
+                      boolean any = false;
+                      for (Rule r : rules) {
+                          if (r.enabled && !r.steps.isEmpty()) any = true;
+                      }
+                      if (!any) {
+                          toast("Нет активных правил с шагами");
+                          return;
+                      }
+                      running = true;
+                      h.post(scan);
+                  }
+                  updateBar();
+              }
+
+              private final Runnable scan = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!running) return;
+                      if (!executing) {
+                          try {
+                              doScan();
+                          } catch (Exception ignored) {
+                          }
+                      }
+                      h.postDelayed(this, Math.max(30, prefs.getInt("iv", 100)));
+                  }
+              };
+
+              private void doScan() {
+                  if (ovl != null) return;
+                  if (dirty || rules == null) reloadRules();
+                  if (rules.isEmpty()) return;
+                  fitDisplay();
+                  Image img = reader.acquireLatestImage();
+                  int[][] pts;
+                  if (img != null) {
+                      try {
+                          pts = find(img);
+                      } finally {
+                          img.close();
+                      }
+                      lastPts = pts;
+                  } else {
+                      pts = lastPts;
+                  }
+                  if (pts == null || pts.length != rules.size()) return;
+                  long now = android.os.SystemClock.uptimeMillis();
+                  int fire = -1;
+                  for (int i = 0; i < rules.size(); i++) {
+                      Rule r = rules.get(i);
+                      if (!r.enabled || r.steps.isEmpty()) continue;
+                      if (pts[i] == null) {
+                          armed[i] = true;
+                          continue;
+                      }
+                      if (fire >= 0) continue;
+                      boolean ok;
+                      if ("interval".equals(r.repeat)) {
+                          ok = now - lastFire[i] >= Math.max(100, r.repeatDelay);
+                      } else if ("once".equals(r.repeat)) {
+                          ok = !done[i];
+                      } else {
+                          ok = armed[i];
+                      }
+                      if (ok) fire = i;
+                  }
+                  if (fire < 0) return;
+                  armed[fire] = false;
+                  done[fire] = true;
+                  lastFire[fire] = now;
+                  runChain(fire, rules.get(fire));
+              }
+
+              private void runChain(final int ri, final Rule r) {
+                  executing = true;
+                  activeRule = ri;
+                  activeStep = 0;
+                  h.post(new Runnable() {
+                      int i = 0;
+
+                      @Override
+                      public void run() {
+                          if (!running || i >= r.steps.size()) {
+                              finishChain();
+                              return;
+                          }
+                          Step s = r.steps.get(i);
+                          activeStep = i;
+                          updateBar();
+                          TapService.tap(s.x, s.y);
+                          i++;
+                          h.postDelayed(this, Math.max(30, s.delay));
+                      }
+                  });
+              }
+
+              private void finishChain() {
+                  executing = false;
+                  activeRule = -1;
+                  activeStep = -1;
+                  updateBar();
+              }
+
+              // один проход по экрану сразу для всех правил; результат: точка для каждого правила или null
+              private int[][] find(Image img) {
+                  Image.Plane pl = img.getPlanes()[0];
+                  ByteBuffer b = pl.getBuffer();
+                  int ps = pl.getPixelStride();
+                  int rs = pl.getRowStride();
+                  int w = img.getWidth();
+                  int hh = img.getHeight();
+                  int n = rules.size();
+                  int cols = (w + CELL - 1) / CELL;
+                  int rows = (hh + CELL - 1) / CELL;
+
+                  int[] act = new int[n];
+                  int na = 0;
+                  int[] tr = new int[n];
+                  int[] tg = new int[n];
+                  int[] tb = new int[n];
+                  int[] tl = new int[n];
+                  int[][] cnt = new int[n][];
+                  long[][] sx = new long[n][];
+                  long[][] sy = new long[n][];
+                  for (int k = 0; k < n; k++) {
+                      Rule r = rules.get(k);
+                      if (!r.enabled || r.steps.isEmpty()) continue;
+                      act[na++] = k;
+                      tr[k] = Color.red(r.color);
+                      tg[k] = Color.green(r.color);
+                      tb[k] = Color.blue(r.color);
+                      tl[k] = r.tolerance;
+                      cnt[k] = new int[cols * rows];
+                      sx[k] = new long[cols * rows];
+                      sy[k] = new long[cols * rows];
+                  }
+                  Rect ex = null;
+                  if (bar != null) {
+                      ex = new Rect(barLp.x - dp(4), barLp.y - dp(4),
+                              barLp.x + bar.getWidth() + dp(4),
+                              barLp.y + bar.getHeight() + dp(4));
+                  }
+
+                  for (int y = 0; y < hh; y += STEP) {
+                      for (int x = 0; x < w; x += STEP) {
+                          if (ex != null && ex.contains(x, y)) continue;
+                          int o = y * rs + x * ps;
+                          int pr = b.get(o) & 0xFF;
+                          int pg = b.get(o + 1) & 0xFF;
+                          int pb = b.get(o + 2) & 0xFF;
+                          for (int a = 0; a < na; a++) {
+                              int k = act[a];
+                              Rule r = rules.get(k);
+                              if (r.hasRegion() && (x < r.rl || x >= r.rr || y < r.rt || y >= r.rb)) continue;
+                              if (Math.abs(pr - tr[k]) <= tl[k]
+                                      && Math.abs(pg - tg[k]) <= tl[k]
+                                      && Math.abs(pb - tb[k]) <= tl[k]) {
+                                  int c = (y / CELL) * cols + (x / CELL);
+                                  cnt[k][c]++;
+                                  sx[k][c] += x;
+                                  sy[k][c] += y;
+                              }
+                          }
+                      }
+                  }
+                  int[][] res = new int[n][];
+                  for (int a = 0; a < na; a++) {
+                      int k = act[a];
+                      int best = -1;
+                      int bestN = 2;
+                      for (int i = 0; i < cnt[k].length; i++) {
+                          if (cnt[k][i] > bestN) {
+                              bestN = cnt[k][i];
+                              best = i;
+                          }
+                      }
+                      if (best >= 0) {
+                          res[k] = new int[]{(int) (sx[k][best] / cnt[k][best]), (int) (sy[k][best] / cnt[k][best])};
+                      }
+                  }
+                  return res;
+              }
+
+              // ---------- пипетка цвета (используется только внутри) ----------
+              private void startPick() {
+                  if (ovl != null) return;
+                  bar.setVisibility(View.INVISIBLE);
+                  ovl = new View(this);
+                  h.postDelayed(() -> grabForPick(0), 250);
+              }
+
+              private void grabForPick(final int n) {
+                  try {
+                      fitDisplay();
+                  } catch (Exception ignored) {
+                  }
+                  Image img = reader.acquireLatestImage();
+                  if (img == null) {
+                      if (n < 12) {
+                          h.postDelayed(() -> grabForPick(n + 1), 120);
+                      } else {
+                          ovl = null;
+                          bar.setVisibility(View.VISIBLE);
+                          toast("Не удалось снять экран");
+                      }
+                      return;
+                  }
+                  Bitmap shot;
+                  try {
+                      Image.Plane pl = img.getPlanes()[0];
+                      Bitmap full = Bitmap.createBitmap(
+                              pl.getRowStride() / pl.getPixelStride(),
+                              img.getHeight(), Bitmap.Config.ARGB_8888);
+                      full.copyPixelsFromBuffer(pl.getBuffer());
+                      shot = Bitmap.createBitmap(full, 0, 0, img.getWidth(), img.getHeight());
+                      if (shot != full) full.recycle();
+                  } finally {
+                      img.close();
+                  }
+                  pv = new PickView(this, shot);
+                  ovl = pv;
+                  wm.addView(pv, params(WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.MATCH_PARENT));
+              }
+
+              private void finishPick(boolean ok) {
+                  int col = 0;
+                  float pvx = pv.px;
+                  float pvy = pv.py;
+                  if (ok) col = pv.pix((int) pvx, (int) pvy) | 0xFF000000;
+                  wm.removeView(pv);
+                  pv.shot.recycle();
+                  pv = null;
+                  ovl = null;
+                  bar.setVisibility(View.VISIBLE);
+                  if (ok) {
+                      prefs.edit().putInt("lastcolor", col)
+                              .putInt("lastx", (int) pvx).putInt("lasty", (int) pvy).apply();
+                      toast(String.format("Сохранено: цвет #%06X и точка (%d, %d). Применить можно в «Правила»",
+                              col & 0xFFFFFF, (int) pvx, (int) pvy));
+                  }
+              }
+
+              private class PickView extends View {
+                  final Bitmap shot;
+                  final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  float px, py;
+                  boolean has;
+
+                  PickView(Context c, Bitmap s) {
+                      super(c);
+                      shot = s;
+                      p.setTextSize(dp(15));
+                  }
+
+                  int pix(int x, int y) {
+                      x = Math.max(0, Math.min(shot.getWidth() - 1, x));
+                      y = Math.max(0, Math.min(shot.getHeight() - 1, y));
+                      return shot.getPixel(x, y);
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      int[] o = new int[2];
+                      getLocationOnScreen(o);
+                      c.drawBitmap(shot, -o[0], -o[1], null);
+                      int w = getWidth();
+                      int hh = getHeight();
+                      int bh = dp(64);
+                      p.setStyle(Paint.Style.FILL);
+                      p.setColor(0xAA000000);
+                      c.drawRect(0, 0, w, dp(40), p);
+                      p.setColor(Color.WHITE);
+                      c.drawText("Проведи пальцем по цвету", dp(12), dp(26), p);
+                      p.setColor(0xEE171A2C);
+                      c.drawRect(0, hh - bh, w, hh, p);
+                      p.setColor(Color.WHITE);
+                      c.drawText("Отмена", dp(24), hh - bh / 2f + dp(5), p);
+                      if (!has) return;
+                      float vx = px - o[0];
+                      float vy = py - o[1];
+                      int col = pix((int) px, (int) py) | 0xFF000000;
+                      int cell = dp(9);
+                      int n = 11;
+                      int size = cell * n;
+                      float lx = Math.max(dp(8), Math.min(w - size - dp(8), vx - size / 2f));
+                      float ly = vy - dp(44) - size;
+                      if (ly < dp(48)) ly = vy + dp(44);
+                      for (int i = 0; i < n; i++) {
+                          for (int j = 0; j < n; j++) {
+                              p.setStyle(Paint.Style.FILL);
+                              p.setColor(pix((int) px + i - 5, (int) py + j - 5) | 0xFF000000);
+                              c.drawRect(lx + i * cell, ly + j * cell,
+                                      lx + (i + 1) * cell, ly + (j + 1) * cell, p);
+                          }
+                      }
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(dp(2));
+                      p.setColor(Color.WHITE);
+                      c.drawRect(lx, ly, lx + size, ly + size, p);
+                      p.setColor(Color.BLACK);
+                      c.drawRect(lx + 5 * cell, ly + 5 * cell,
+                              lx + 6 * cell, ly + 6 * cell, p);
+                      p.setColor(Color.WHITE);
+                      c.drawCircle(vx, vy, dp(14), p);
+                      p.setStyle(Paint.Style.FILL);
+                      p.setColor(col);
+                      c.drawRect(w / 2f, hh - bh, w, hh, p);
+                      boolean light = (Color.red(col) * 299 + Color.green(col) * 587
+                              + Color.blue(col) * 114) / 1000 > 140;
+                      p.setColor(light ? Color.BLACK : Color.WHITE);
+                      c.drawText(String.format("Выбрать #%06X", col & 0xFFFFFF),
+                              w / 2f + dp(16), hh - bh / 2f + dp(5), p);
+                  }
+
+                  @Override
+                  public boolean onTouchEvent(MotionEvent e) {
+                      float rx = e.getRawX();
+                      float ry = e.getRawY();
+                      boolean inBtn = ry > ch - dp(64);
+                      switch (e.getAction()) {
+                          case MotionEvent.ACTION_DOWN:
+                          case MotionEvent.ACTION_MOVE:
+                              if (!inBtn) {
+                                  px = rx;
+                                  py = ry;
+                                  has = true;
+                                  invalidate();
+                              }
+                              return true;
+                          case MotionEvent.ACTION_UP:
+                              if (inBtn) {
+                                  if (rx < cw / 2f) finishPick(false);
+                                  else if (has) finishPick(true);
+                              }
+                              return true;
+                          default:
+                              return true;
+                      }
+                  }
+              }
+
+              // ---------- область поиска ----------
+              private void startRegion() {
+                  if (ovl != null) return;
+                  bar.setVisibility(View.INVISIBLE);
+                  ovl = new RegView(this);
+                  wm.addView(ovl, params(WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.MATCH_PARENT));
+              }
+
+              private void endRegion(Rect rc) {
+                  wm.removeView(ovl);
+                  ovl = null;
+                  bar.setVisibility(View.VISIBLE);
+                  if (rc.width() >= dp(24) && rc.height() >= dp(24)) {
+                      prefs.edit().putInt("lrl", rc.left).putInt("lrt", rc.top)
+                              .putInt("lrr", rc.right).putInt("lrb", rc.bottom).apply();
+                      toast("Область сохранена. Применить можно в «Правила»");
+                  }
+              }
+
+              private class RegView extends View {
+                  final Paint dim = new Paint();
+                  final Paint line = new Paint();
+                  final Paint txt = new Paint();
+                  float x0, y0, x1, y1;
+                  boolean has;
+
+                  RegView(Context c) {
+                      super(c);
+                      dim.setColor(0x88000000);
+                      line.setColor(0xFF6C8CFF);
+                      line.setStyle(Paint.Style.STROKE);
+                      line.setStrokeWidth(dp(2));
+                      txt.setColor(Color.WHITE);
+                      txt.setTextSize(dp(16));
+                      txt.setAntiAlias(true);
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      int[] o = new int[2];
+                      getLocationOnScreen(o);
+                      int w = getWidth();
+                      int hh = getHeight();
+                      if (!has) {
+                          c.drawRect(0, 0, w, hh, dim);
+                          c.drawText("Выдели область, где искать цвет", dp(24), dp(80), txt);
+                          return;
+                      }
+                      float l = Math.min(x0, x1) - o[0];
+                      float r = Math.max(x0, x1) - o[0];
+                      float t = Math.min(y0, y1) - o[1];
+                      float b = Math.max(y0, y1) - o[1];
+                      c.drawRect(0, 0, w, t, dim);
+                      c.drawRect(0, b, w, hh, dim);
+                      c.drawRect(0, t, l, b, dim);
+                      c.drawRect(r, t, w, b, dim);
+                      c.drawRect(l, t, r, b, line);
+                  }
+
+                  @Override
+                  public boolean onTouchEvent(MotionEvent e) {
+                      switch (e.getAction()) {
+                          case MotionEvent.ACTION_DOWN:
+                              x0 = e.getRawX();
+                              x1 = x0;
+                              y0 = e.getRawY();
+                              y1 = y0;
+                              has = true;
+                              invalidate();
+                              return true;
+                          case MotionEvent.ACTION_MOVE:
+                              x1 = e.getRawX();
+                              y1 = e.getRawY();
+                              invalidate();
+                              return true;
+                          case MotionEvent.ACTION_UP:
+                              x1 = e.getRawX();
+                              y1 = e.getRawY();
+                              endRegion(new Rect((int) Math.min(x0, x1), (int) Math.min(y0, y1),
+                                      (int) Math.max(x0, x1), (int) Math.max(y0, y1)));
+                              return true;
+                          default:
+                              return true;
+                      }
+                  }
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(prefListener);
+                  h.removeCallbacksAndMessages(null);
+                  try {
+                      if (ovl != null && ovl.getParent() != null) wm.removeView(ovl);
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      if (bar != null) wm.removeView(bar);
+                  } catch (Exception ignored) {
+                  }
+                  if (vd != null) vd.release();
+                  if (reader != null) reader.close();
+                  if (mp != null) {
+                      try {
+                          mp.unregisterCallback(mpCallback);
+                          mp.stop();
+                      } catch (Exception ignored) {
+                      }
+                  }
+                  super.onDestroy();
+              }
+          }
+          FILE_5_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/MainActivity.java <<'FILE_6_END'
+          package com.mushka.colortap;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              private SharedPreferences prefs;
+              private TextView status;
+              private LinearLayout root;
+              private boolean askedNotifications = false;
+              private RuleManager rm;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  prefs = getSharedPreferences("c", MODE_PRIVATE);
+                  rm = new RuleManager(this);
+                  int pad = dp(20);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Color.parseColor("#0E1020"));
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad * 2, pad, pad);
+                  sv.addView(root);
+
+                  root.addView(label("Автокликер по цвету 2.0", 26));
+                  root.addView(label("Приложение ищет заданный цвет на экране и выполняет цепочку тапов в указанные точки. Правил может быть сколько угодно, шагов в правиле — до 50. Пипетка (цвет и точка) и область поиска выбираются на плавающей панели после запуска.", 15));
+
+                  status = label("", 14);
+                  root.addView(status);
+
+                  Button acc = new Button(this);
+                  acc.setText("1. Включить службу доступности");
+                  acc.setOnClickListener(v -> startActivity(
+                          new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+                  root.addView(acc);
+
+                  Button rules = new Button(this);
+                  rules.setText("2. Правила и шаги");
+                  rules.setOnClickListener(v -> startActivity(
+                          new Intent(this, RulesActivity.class)));
+                  root.addView(rules);
+
+                  Button go = new Button(this);
+                  go.setText("3. Запустить");
+                  go.setOnClickListener(v -> start());
+                  root.addView(go);
+
+                  root.addView(label("", 8));
+                  root.addView(label("Конфиги", 20));
+
+                  Button saveProf = new Button(this);
+                  saveProf.setText("Сохранить профиль как…");
+                  saveProf.setOnClickListener(v -> saveProfileDialog());
+                  root.addView(saveProf);
+
+                  Button loadProf = new Button(this);
+                  loadProf.setText("Загрузить профиль");
+                  loadProf.setOnClickListener(v -> loadProfileDialog());
+                  root.addView(loadProf);
+
+                  Button exp = new Button(this);
+                  exp.setText("Экспорт в буфер обмена");
+                  exp.setOnClickListener(v -> {
+                      String json = rm.exportAll();
+                      ClipboardManager cm = (ClipboardManager)
+                              getSystemService(Context.CLIPBOARD_SERVICE);
+                      cm.setPrimaryClip(ClipData.newPlainText("colortap", json));
+                      Toast.makeText(this, "Скопировано в буфер", Toast.LENGTH_SHORT).show();
+                  });
+                  root.addView(exp);
+
+                  Button imp = new Button(this);
+                  imp.setText("Импорт из буфера обмена");
+                  imp.setOnClickListener(v -> {
+                      ClipboardManager cm = (ClipboardManager)
+                              getSystemService(Context.CLIPBOARD_SERVICE);
+                      if (cm.hasPrimaryClip() && cm.getPrimaryClip().getItemCount() > 0) {
+                          String json = cm.getPrimaryClip().getItemAt(0)
+                                  .coerceToText(this).toString();
+                          rm.importAll(json);
+                          Toast.makeText(this, "Импортировано", Toast.LENGTH_SHORT).show();
+                      } else {
+                          Toast.makeText(this, "Буфер пуст", Toast.LENGTH_SHORT).show();
+                      }
+                  });
+                  root.addView(imp);
+
+                  Button clr = new Button(this);
+                  clr.setText("Очистить всё");
+                  clr.setOnClickListener(v -> {
+                      rm.clearAll();
+                      Toast.makeText(this, "Очищено", Toast.LENGTH_SHORT).show();
+                  });
+                  root.addView(clr);
+
+                  setContentView(sv);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  status.setText("Служба доступности: "
+                          + (TapService.inst != null ? "включена" : "выключена"));
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private TextView label(String text, int size) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.WHITE);
+                  t.setPadding(0, size > 20 ? 0 : dp(8), 0, dp(8));
+                  return t;
+              }
+
+              private void saveProfileDialog() {
+                  android.app.AlertDialog.Builder b =
+                          new android.app.AlertDialog.Builder(this);
+                  b.setTitle("Имя профиля");
+                  final android.widget.EditText e = new android.widget.EditText(this);
+                  b.setView(e);
+                  b.setPositiveButton("Сохранить", (d, w) -> {
+                      String name = e.getText().toString().trim();
+                      if (!name.isEmpty()) {
+                          rm.saveProfile(name, rm.load());
+                          Toast.makeText(this, "Профиль сохранён", Toast.LENGTH_SHORT).show();
+                      }
+                  });
+                  b.setNegativeButton("Отмена", null);
+                  b.show();
+              }
+
+              private void loadProfileDialog() {
+                  final java.util.List<String> names = rm.profileNames();
+                  if (names.isEmpty()) {
+                      Toast.makeText(this, "Нет сохранённых профилей", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  android.app.AlertDialog.Builder b =
+                          new android.app.AlertDialog.Builder(this);
+                  b.setTitle("Загрузить профиль");
+                  b.setItems(names.toArray(new String[0]), (d, i) -> {
+                      rm.save(rm.loadProfile(names.get(i)));
+                      Toast.makeText(this, "Профиль загружен", Toast.LENGTH_SHORT).show();
+                  });
+                  b.setNeutralButton("Удалить…", (d, w) -> {
+                      android.app.AlertDialog.Builder b2 =
+                              new android.app.AlertDialog.Builder(this);
+                      b2.setTitle("Удалить профиль");
+                      b2.setItems(names.toArray(new String[0]), (dd, ii) -> {
+                          rm.deleteProfile(names.get(ii));
+                          Toast.makeText(this, "Удалён", Toast.LENGTH_SHORT).show();
+                      });
+                      b2.show();
+                  });
+                  b.show();
+              }
+
+              private void start() {
+                  if (TapService.inst == null) {
+                      Toast.makeText(this, "Включи службу доступности",
+                              Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                      return;
+                  }
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Разреши показ поверх других окон",
+                              Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(
+                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 && !askedNotifications
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      askedNotifications = true;
+                      requestPermissions(
+                              new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7);
+                      return;
+                  }
+                  MediaProjectionManager m = (MediaProjectionManager)
+                          getSystemService(MEDIA_PROJECTION_SERVICE);
+                  startActivityForResult(m.createScreenCaptureIntent(), 1);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+                  super.onRequestPermissionsResult(code, perms, res);
+                  start();
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == 1 && res == RESULT_OK && data != null) {
+                      Intent i = new Intent(this, ColorService.class);
+                      i.putExtra("code", res);
+                      i.putExtra("data", data);
+                      startForegroundService(i);
+                      moveTaskToBack(true);
+                  }
+              }
+          }
+          FILE_6_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/Rule.java <<'FILE_7_END'
+          package com.mushka.colortap;
+
+          import org.json.JSONArray;
+          import org.json.JSONException;
+          import org.json.JSONObject;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class Rule {
+              public String name = "Новое правило";
+              public int color = 0xFFFF3333;
+              public int tolerance = 25;
+              public boolean enabled = true;
+              public int rl = -1, rt = -1, rr = -1, rb = -1;
+              public String repeat = "wait_gone";
+              public int repeatDelay = 500;
+              public List<Step> steps = new ArrayList<>();
+
+              public boolean hasRegion() {
+                  return rr > rl && rb > rt && rl >= 0;
+              }
+
+              public JSONObject toJson() throws JSONException {
+                  JSONObject o = new JSONObject();
+                  o.put("name", name);
+                  o.put("color", color);
+                  o.put("tolerance", tolerance);
+                  o.put("enabled", enabled);
+                  o.put("rl", rl);
+                  o.put("rt", rt);
+                  o.put("rr", rr);
+                  o.put("rb", rb);
+                  o.put("repeat", repeat);
+                  o.put("repeatDelay", repeatDelay);
+                  JSONArray a = new JSONArray();
+                  for (Step s : steps) a.put(s.toJson());
+                  o.put("steps", a);
+                  return o;
+              }
+
+              public static Rule fromJson(JSONObject o) throws JSONException {
+                  Rule r = new Rule();
+                  r.name = o.optString("name", "Правило");
+                  r.color = o.optInt("color", 0xFFFF3333);
+                  r.tolerance = o.optInt("tolerance", 25);
+                  r.enabled = o.optBoolean("enabled", true);
+                  r.rl = o.optInt("rl", -1);
+                  r.rt = o.optInt("rt", -1);
+                  r.rr = o.optInt("rr", -1);
+                  r.rb = o.optInt("rb", -1);
+                  r.repeat = o.optString("repeat", "wait_gone");
+                  r.repeatDelay = o.optInt("repeatDelay", 500);
+                  JSONArray a = o.optJSONArray("steps");
+                  if (a != null) {
+                      for (int i = 0; i < a.length(); i++) {
+                          r.steps.add(Step.fromJson(a.getJSONObject(i)));
+                      }
+                  }
+                  return r;
+              }
+          }
+          FILE_7_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/RuleEditActivity.java <<'FILE_8_END'
+          package com.mushka.colortap;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.List;
+
+          public class RuleEditActivity extends Activity {
+              private static final String[] MODES = {"wait_gone", "interval", "once"};
+              private static final String[] MODE_NAMES = {
+                      "ждать, пока цвет исчезнет",
+                      "повторять каждые N мс, пока цвет виден",
+                      "сработать один раз"};
+
+              private RuleManager rm;
+              private SharedPreferences prefs;
+              private List<Rule> rules;
+              private Rule rule;
+              private int idx;
+              private LinearLayout stepsBox;
+              private TextView tolLabel;
+              private TextView regionLabel;
+              private EditText nameEt;
+              private EditText delayEt;
+              private Button colorBtn;
+              private Button repeatBtn;
+              private SeekBar tolBar;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  rm = new RuleManager(this);
+                  prefs = getSharedPreferences("c", MODE_PRIVATE);
+                  rules = rm.load();
+                  idx = getIntent().getIntExtra("idx", 0);
+                  if (idx < 0 || idx >= rules.size()) {
+                      finish();
+                      return;
+                  }
+                  rule = rules.get(idx);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Color.parseColor("#0E1020"));
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(16);
+                  root.setPadding(pad, pad, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Настройка правила");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  nameEt = new EditText(this);
+                  nameEt.setText(rule.name);
+                  nameEt.setTextColor(Color.WHITE);
+                  nameEt.setHint("Имя правила");
+                  nameEt.setHintTextColor(0xFF777777);
+                  nameEt.setInputType(InputType.TYPE_CLASS_TEXT);
+                  root.addView(nameEt);
+
+                  colorBtn = new Button(this);
+                  colorBtn.setOnClickListener(v -> pickColor());
+                  root.addView(colorBtn);
+
+                  tolLabel = new TextView(this);
+                  tolLabel.setTextColor(Color.WHITE);
+                  tolLabel.setTextSize(14);
+                  root.addView(tolLabel);
+
+                  tolBar = new SeekBar(this);
+                  tolBar.setMax(80);
+                  tolBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean f) {
+                          rule.tolerance = p;
+                          tolLabel.setText("Допуск цвета: " + p);
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) {
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) {
+                      }
+                  });
+                  root.addView(tolBar);
+
+                  regionLabel = new TextView(this);
+                  regionLabel.setTextColor(Color.WHITE);
+                  regionLabel.setTextSize(14);
+                  regionLabel.setPadding(0, dp(8), 0, 0);
+                  root.addView(regionLabel);
+
+                  Button regBtn = new Button(this);
+                  regBtn.setText("Взять последнюю область с панели");
+                  regBtn.setOnClickListener(v -> {
+                      if (prefs.contains("lrl")) {
+                          rule.rl = prefs.getInt("lrl", -1);
+                          rule.rt = prefs.getInt("lrt", -1);
+                          rule.rr = prefs.getInt("lrr", -1);
+                          rule.rb = prefs.getInt("lrb", -1);
+                          updateLabels();
+                      } else {
+                          Toast.makeText(this, "Сначала выбери область кнопкой «Область» на панели",
+                                  Toast.LENGTH_LONG).show();
+                      }
+                  });
+                  root.addView(regBtn);
+
+                  Button regClear = new Button(this);
+                  regClear.setText("Сбросить область (весь экран)");
+                  regClear.setOnClickListener(v -> {
+                      rule.rl = -1;
+                      rule.rt = -1;
+                      rule.rr = -1;
+                      rule.rb = -1;
+                      updateLabels();
+                  });
+                  root.addView(regClear);
+
+                  repeatBtn = new Button(this);
+                  repeatBtn.setOnClickListener(v -> {
+                      int cur = 0;
+                      for (int i = 0; i < MODES.length; i++) {
+                          if (MODES[i].equals(rule.repeat)) cur = i;
+                      }
+                      rule.repeat = MODES[(cur + 1) % MODES.length];
+                      updateLabels();
+                  });
+                  root.addView(repeatBtn);
+
+                  TextView dl = new TextView(this);
+                  dl.setText("Интервал повтора, мс (для режима «повторять каждые N мс»)");
+                  dl.setTextColor(0xFFBBBBBB);
+                  dl.setTextSize(13);
+                  root.addView(dl);
+                  delayEt = new EditText(this);
+                  delayEt.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  delayEt.setTextColor(Color.WHITE);
+                  root.addView(delayEt);
+
+                  TextView stepsTitle = new TextView(this);
+                  stepsTitle.setText("Шаги (до 50)");
+                  stepsTitle.setTextColor(Color.WHITE);
+                  stepsTitle.setTextSize(18);
+                  stepsTitle.setPadding(0, dp(16), 0, dp(8));
+                  root.addView(stepsTitle);
+
+                  stepsBox = new LinearLayout(this);
+                  stepsBox.setOrientation(LinearLayout.VERTICAL);
+                  root.addView(stepsBox);
+
+                  Button addStep = new Button(this);
+                  addStep.setText("+ Добавить шаг");
+                  addStep.setOnClickListener(v -> {
+                      if (rule.steps.size() >= 50) {
+                          Toast.makeText(this, "Максимум 50 шагов", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      Step s = new Step();
+                      s.x = prefs.getInt("lastx", 500);
+                      s.y = prefs.getInt("lasty", 1000);
+                      s.delay = 500;
+                      rule.steps.add(s);
+                      persist();
+                      rebuildSteps();
+                  });
+                  root.addView(addStep);
+
+                  Button done = new Button(this);
+                  done.setText("Готово");
+                  done.setOnClickListener(v -> finish());
+                  root.addView(done);
+
+                  setContentView(sv);
+                  fillFromRule();
+                  rebuildSteps();
+              }
+
+              private void fillFromRule() {
+                  tolBar.setProgress(rule.tolerance);
+                  delayEt.setText(String.valueOf(rule.repeatDelay));
+                  updateLabels();
+              }
+
+              private void updateLabels() {
+                  colorBtn.setText(String.format("Цвет: #%06X (нажми, чтобы изменить)", rule.color & 0xFFFFFF));
+                  colorBtn.setTextColor(rule.color | 0xFF000000);
+                  tolLabel.setText("Допуск цвета: " + rule.tolerance);
+                  if (rule.hasRegion()) {
+                      regionLabel.setText("Область: " + rule.rl + "," + rule.rt + " — " + rule.rr + "," + rule.rb);
+                  } else {
+                      regionLabel.setText("Область: весь экран");
+                  }
+                  String mn = MODE_NAMES[0];
+                  for (int i = 0; i < MODES.length; i++) {
+                      if (MODES[i].equals(rule.repeat)) mn = MODE_NAMES[i];
+                  }
+                  repeatBtn.setText("Повтор: " + mn);
+              }
+
+              private void persist() {
+                  if (rule == null) return;
+                  String n = nameEt.getText().toString().trim();
+                  rule.name = n.isEmpty() ? "Правило" : n;
+                  try {
+                      rule.repeatDelay = Math.max(100, Integer.parseInt(delayEt.getText().toString().trim()));
+                  } catch (Exception ignored) {
+                  }
+                  rm.save(rules);
+              }
+
+              private void pickColor() {
+                  final boolean hasLast = prefs.contains("lastcolor");
+                  String[] items = hasLast
+                          ? new String[]{String.format("Взять цвет пипетки (#%06X)", prefs.getInt("lastcolor", 0) & 0xFFFFFF),
+                          "Ввести HEX вручную"}
+                          : new String[]{"Ввести HEX вручную (пипетка: кнопка «Пипетка» на панели)"};
+                  new AlertDialog.Builder(this)
+                          .setTitle("Цвет правила")
+                          .setItems(items, (d, which) -> {
+                              if (hasLast && which == 0) {
+                                  rule.color = prefs.getInt("lastcolor", rule.color) | 0xFF000000;
+                                  updateLabels();
+                              } else {
+                                  hexDialog();
+                              }
+                          })
+                          .show();
+              }
+
+              private void hexDialog() {
+                  AlertDialog.Builder b = new AlertDialog.Builder(this);
+                  b.setTitle("Цвет в HEX (RRGGBB)");
+                  final EditText e = new EditText(this);
+                  e.setText(String.format("%06X", rule.color & 0xFFFFFF));
+                  b.setView(e);
+                  b.setPositiveButton("OK", (d, w) -> {
+                      try {
+                          String t = e.getText().toString().trim().replace("#", "");
+                          int c = (int) Long.parseLong(t, 16);
+                          rule.color = 0xFF000000 | c;
+                          updateLabels();
+                      } catch (Exception ignored) {
+                      }
+                  });
+                  b.setNegativeButton("Отмена", null);
+                  b.show();
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private void rebuildSteps() {
+                  stepsBox.removeAllViews();
+                  for (int i = 0; i < rule.steps.size(); i++) {
+                      final int sidx = i;
+                      final Step s = rule.steps.get(i);
+                      LinearLayout row = new LinearLayout(this);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      row.setGravity(Gravity.CENTER_VERTICAL);
+                      row.setPadding(0, dp(4), 0, dp(4));
+
+                      TextView t = new TextView(this);
+                      t.setText("Шаг " + (i + 1) + ":  (" + s.x + ", " + s.y + ")  пауза " + s.delay + " мс");
+                      t.setTextColor(Color.WHITE);
+                      t.setTextSize(14);
+                      LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                              0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+                      t.setLayoutParams(lp);
+                      row.addView(t);
+
+                      Button ed = new Button(this);
+                      ed.setText("Изм.");
+                      ed.setOnClickListener(v -> {
+                          persist();
+                          Intent it = new Intent(this, StepEditActivity.class);
+                          it.putExtra("ri", idx);
+                          it.putExtra("si", sidx);
+                          startActivity(it);
+                      });
+                      row.addView(ed);
+
+                      Button del = new Button(this);
+                      del.setText("✕");
+                      del.setOnClickListener(v -> {
+                          rule.steps.remove(sidx);
+                          persist();
+                          rebuildSteps();
+                      });
+                      row.addView(del);
+
+                      stepsBox.addView(row);
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  persist();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (stepsBox == null) return;
+                  rules = rm.load();
+                  if (idx >= 0 && idx < rules.size()) {
+                      rule = rules.get(idx);
+                      fillFromRule();
+                  }
+                  rebuildSteps();
+              }
+          }
+          FILE_8_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/RuleManager.java <<'FILE_9_END'
+          package com.mushka.colortap;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class RuleManager {
+              private static final String KEY = "rules_v2";
+              private final SharedPreferences prefs;
+
+              public RuleManager(Context c) {
+                  prefs = c.getSharedPreferences("c", Context.MODE_PRIVATE);
+              }
+
+              public List<Rule> load() {
+                  List<Rule> list = new ArrayList<>();
+                  String s = prefs.getString(KEY, "");
+                  if (s == null || s.isEmpty()) {
+                      Rule r = new Rule();
+                      r.name = "Пример";
+                                r.enabled = false;
+                      Step st = new Step();
+                      st.x = 500;
+                      st.y = 1200;
+                      st.delay = 800;
+                      r.steps.add(st);
+                      list.add(r);
+                      return list;
+                  }
+                  try {
+                      JSONArray a = new JSONArray(s);
+                      for (int i = 0; i < a.length(); i++) {
+                          list.add(Rule.fromJson(a.getJSONObject(i)));
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  return list;
+              }
+
+              public void save(List<Rule> list) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      for (Rule r : list) a.put(r.toJson());
+                      prefs.edit().putString(KEY, a.toString()).apply();
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              public List<String> profileNames() {
+                  List<String> out = new ArrayList<>();
+                  try {
+                      JSONObject root = new JSONObject(prefs.getString("profiles", "{}"));
+                      JSONArray names = root.names();
+                      if (names != null) {
+                          for (int i = 0; i < names.length(); i++) out.add(names.getString(i));
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  return out;
+              }
+
+              public void saveProfile(String name, List<Rule> rules) {
+                  try {
+                      JSONObject root = new JSONObject(prefs.getString("profiles", "{}"));
+                      JSONArray a = new JSONArray();
+                      for (Rule r : rules) a.put(r.toJson());
+                      root.put(name, a);
+                      prefs.edit().putString("profiles", root.toString()).apply();
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              public List<Rule> loadProfile(String name) {
+                  List<Rule> out = new ArrayList<>();
+                  try {
+                      JSONObject root = new JSONObject(prefs.getString("profiles", "{}"));
+                      JSONArray a = root.optJSONArray(name);
+                      if (a != null) {
+                          for (int i = 0; i < a.length(); i++) {
+                              out.add(Rule.fromJson(a.getJSONObject(i)));
+                          }
+                      }
+                  } catch (Exception ignored) {
+                  }
+                  return out;
+              }
+
+              public void deleteProfile(String name) {
+                  try {
+                      JSONObject root = new JSONObject(prefs.getString("profiles", "{}"));
+                      root.remove(name);
+                      prefs.edit().putString("profiles", root.toString()).apply();
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              public String exportAll() {
+                  try {
+                      JSONObject root = new JSONObject();
+                      JSONArray a = new JSONArray();
+                      for (Rule r : load()) a.put(r.toJson());
+                      root.put("rules", a);
+                      root.put("profiles", new JSONObject(prefs.getString("profiles", "{}")));
+                      return root.toString();
+                  } catch (Exception e) {
+                      return "{}";
+                  }
+              }
+
+              public void importAll(String json) {
+                  try {
+                      JSONObject root = new JSONObject(json);
+                      JSONArray a = root.optJSONArray("rules");
+                      if (a != null) {
+                          List<Rule> list = new ArrayList<>();
+                          for (int i = 0; i < a.length(); i++) list.add(Rule.fromJson(a.getJSONObject(i)));
+                          save(list);
+                      }
+                      JSONObject p = root.optJSONObject("profiles");
+                      if (p != null) prefs.edit().putString("profiles", p.toString()).apply();
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              public void clearAll() {
+                  prefs.edit().remove(KEY).remove("profiles").apply();
+              }
+          }
+          FILE_9_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/RulesActivity.java <<'FILE_10_END'
+          package com.mushka.colortap;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import java.util.List;
+
+          public class RulesActivity extends Activity {
+              private RuleManager rm;
+              private LinearLayout list;
+              private List<Rule> rules;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  rm = new RuleManager(this);
+                  rules = rm.load();
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Color.parseColor("#0E1020"));
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(16);
+                  root.setPadding(pad, pad, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Правила");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  list = new LinearLayout(this);
+                  list.setOrientation(LinearLayout.VERTICAL);
+                  root.addView(list);
+
+                  Button add = new Button(this);
+                  add.setText("+ Добавить правило");
+                  add.setOnClickListener(v -> {
+                      Rule r = new Rule();
+                      r.name = "Правило " + (rules.size() + 1);
+                      rules.add(r);
+                      rm.save(rules);
+                      rebuild();
+                  });
+                  root.addView(add);
+
+                  Button back = new Button(this);
+                  back.setText("Назад");
+                  back.setOnClickListener(v -> finish());
+                  root.addView(back);
+
+                  setContentView(sv);
+                  rebuild();
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private void rebuild() {
+                  list.removeAllViews();
+                  for (int i = 0; i < rules.size(); i++) {
+                      final int idx = i;
+                      final Rule r = rules.get(i);
+                      LinearLayout row = new LinearLayout(this);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      row.setGravity(Gravity.CENTER_VERTICAL);
+                      row.setPadding(0, dp(8), 0, dp(8));
+
+                      CheckBox cb = new CheckBox(this);
+                      cb.setChecked(r.enabled);
+                      cb.setOnCheckedChangeListener((v, c) -> {
+                          r.enabled = c;
+                          rm.save(rules);
+                      });
+                      row.addView(cb);
+
+                      TextView name = new TextView(this);
+                      name.setText(r.name + "  ·  шагов: " + r.steps.size());
+                      name.setTextColor(Color.WHITE);
+                      name.setTextSize(16);
+                      name.setPadding(dp(4), 0, dp(4), 0);
+                      LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                              0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+                      name.setLayoutParams(lp);
+                      row.addView(name);
+
+                      Button edit = new Button(this);
+                      edit.setText("Изм.");
+                      edit.setOnClickListener(v -> {
+                          Intent it = new Intent(this, RuleEditActivity.class);
+                          it.putExtra("idx", idx);
+                          startActivity(it);
+                      });
+                      row.addView(edit);
+
+                      Button del = new Button(this);
+                      del.setText("✕");
+                      del.setOnClickListener(v -> {
+                          rules.remove(idx);
+                          rm.save(rules);
+                          rebuild();
+                      });
+                      row.addView(del);
+
+                      list.addView(row);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  rules = rm.load();
+                  rebuild();
+              }
+          }
+          FILE_10_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/Step.java <<'FILE_11_END'
+          package com.mushka.colortap;
+
+          import org.json.JSONException;
+          import org.json.JSONObject;
+
+          public class Step {
+              public int x = 0;
+              public int y = 0;
+              public int delay = 500;
+
+              public JSONObject toJson() throws JSONException {
+                  JSONObject o = new JSONObject();
+                  o.put("x", x);
+                  o.put("y", y);
+                  o.put("delay", delay);
+                  return o;
+              }
+
+              public static Step fromJson(JSONObject o) throws JSONException {
+                  Step s = new Step();
+                  s.x = o.optInt("x", 0);
+                  s.y = o.optInt("y", 0);
+                  s.delay = o.optInt("delay", 500);
+                  return s;
+              }
+          }
+          FILE_11_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/StepEditActivity.java <<'FILE_12_END'
+          package com.mushka.colortap;
+
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import java.util.List;
+
+          public class StepEditActivity extends Activity {
+              private RuleManager rm;
+              private List<Rule> rules;
+              private Rule rule;
+              private Step step;
+              private int ri, si;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  rm = new RuleManager(this);
+                  rules = rm.load();
+                  ri = getIntent().getIntExtra("ri", 0);
+                  si = getIntent().getIntExtra("si", 0);
+                  if (ri < 0 || ri >= rules.size()) { finish(); return; }
+                  rule = rules.get(ri);
+                  if (si < 0 || si >= rule.steps.size()) { finish(); return; }
+                  step = rule.steps.get(si);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setBackgroundColor(Color.parseColor("#0E1020"));
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(16);
+                  root.setPadding(pad, pad, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Шаг " + (si + 1));
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  root.addView(lbl("X (координата)"));
+                  EditText ex = new EditText(this);
+                  ex.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  ex.setText(String.valueOf(step.x));
+                  ex.setTextColor(Color.WHITE);
+                  root.addView(ex);
+
+                  root.addView(lbl("Y (координата)"));
+                  EditText ey = new EditText(this);
+                  ey.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  ey.setText(String.valueOf(step.y));
+                  ey.setTextColor(Color.WHITE);
+                  root.addView(ey);
+
+                  root.addView(lbl("Задержка после тапа, мс"));
+                  EditText ed = new EditText(this);
+                  ed.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  ed.setText(String.valueOf(step.delay));
+                  ed.setTextColor(Color.WHITE);
+                  root.addView(ed);
+
+                  final android.content.SharedPreferences sp = getSharedPreferences("c", MODE_PRIVATE);
+                  Button pt = new Button(this);
+                  pt.setText(sp.contains("lastx")
+                          ? "Взять точку пипетки (" + sp.getInt("lastx", 0) + ", " + sp.getInt("lasty", 0) + ")"
+                          : "Точка не выбрана (используй «Пипетка» на панели)");
+                  pt.setOnClickListener(v -> {
+                      if (sp.contains("lastx")) {
+                          ex.setText(String.valueOf(sp.getInt("lastx", 0)));
+                          ey.setText(String.valueOf(sp.getInt("lasty", 0)));
+                      }
+                  });
+                  root.addView(pt);
+
+                  Button save = new Button(this);
+                  save.setText("Сохранить");
+                  save.setOnClickListener(v -> {
+                      try {
+                          step.x = Integer.parseInt(ex.getText().toString().trim());
+                      } catch (Exception ignored) {}
+                      try {
+                          step.y = Integer.parseInt(ey.getText().toString().trim());
+                      } catch (Exception ignored) {}
+                      try {
+                          step.delay = Integer.parseInt(ed.getText().toString().trim());
+                      } catch (Exception ignored) {}
+                      rm.save(rules);
+                      finish();
+                  });
+                  root.addView(save);
+
+                  Button back = new Button(this);
+                  back.setText("Назад");
+                  back.setOnClickListener(v -> finish());
+                  root.addView(back);
+
+                  setContentView(sv);
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private TextView lbl(String t) {
+                  TextView v = new TextView(this);
+                  v.setText(t);
+                  v.setTextColor(0xFFBBBBBB);
+                  v.setTextSize(14);
+                  v.setPadding(0, dp(10), 0, dp(4));
+                  return v;
+              }
+          }
+          FILE_12_END
+          mkdir -p app/src/main/java/com/mushka/colortap
+          cat > app/src/main/java/com/mushka/colortap/TapService.java <<'FILE_13_END'
+          package com.mushka.colortap;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.content.Intent;
+          import android.graphics.Path;
+          import android.view.accessibility.AccessibilityEvent;
+
+          public class TapService extends AccessibilityService {
+              static volatile TapService inst;
+
+              @Override
+              protected void onServiceConnected() {
+                  super.onServiceConnected();
+                  inst = this;
+              }
+
+              @Override
+              public boolean onUnbind(Intent intent) {
+                  inst = null;
+                  return super.onUnbind(intent);
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+              }
+
+              @Override
+              public void onInterrupt() {
+              }
+
+              public static boolean tap(float x, float y) {
+                  TapService s = inst;
+                  if (s == null) return false;
+                  Path p = new Path();
+                  p.moveTo(x, y);
+                  GestureDescription.StrokeDescription st =
+                          new GestureDescription.StrokeDescription(p, 0, 40);
+                  return s.dispatchGesture(
+                          new GestureDescription.Builder().addStroke(st).build(), null, null);
+              }
+          }
+          FILE_13_END
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'FILE_14_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#1B1E30"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FF5A7A"
+                  android:pathData="M54,54m-26,0a26,26 0,1 1,52 0a26,26 0,1 1,-52 0" />
+              <path
+                  android:fillColor="#1B1E30"
+                  android:pathData="M54,54m-12,0a12,12 0,1 1,24 0a12,12 0,1 1,-24 0" />
+          </vector>
+          FILE_14_END
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'FILE_15_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="acc_desc">Нужна, чтобы приложение само нажимало на экран, когда видит выбранный цвет.</string>
+          </resources>
+          FILE_15_END
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/tap_service.xml <<'FILE_16_END'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
+          FILE_16_END
+
+      - name: Сборка APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Готовый файл
+        run: cp app/build/outputs/apk/debug/app-debug.apk color-tap-v2.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: colortap-v2-${{ github.run_number }}
+          name: Автокликер по цвету 2.0, сборка ${{ github.run_number }}
+          files: color-tap-v2.apk
